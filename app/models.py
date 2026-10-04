@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Annotated, List, Literal, Optional, Sequence
+from typing import Annotated, List, Literal, Optional, Sequence, Union
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -341,6 +341,137 @@ class SettlementResponse(BaseModel):
     periods: List[SettlementPeriodResult]
     summary: SettlementSummary
     audit_summary: SettlementAuditSummary
+
+
+class RescheduleRequest(BaseModel):
+    """计划中途续排请求：原计划输入与快照、已执行实测前缀、审计容差与剩余时段新预测。"""
+
+    dispatch: DispatchRequest = Field(description="生成原计划时使用的完整 /dispatch 输入")
+    plan_snapshot: DispatchResponse = Field(
+        description="当初 /dispatch 返回的计划快照（periods + summary），服务端会重算并核对"
+    )
+    audit_tolerance_kwh: float = Field(
+        ge=0.0, description="前缀遥测审计容差（kWh），判定规则同 /telemetry/audit"
+    )
+    records: Annotated[
+        List[TelemetryRecord], Field(min_length=1, max_length=MAX_PERIODS)
+    ] = Field(description="已连续执行的实测前缀（至少一段，且须留有待执行时段）")
+    remaining_prices: Prices = Field(description="剩余时段的新电价（元/kWh）")
+    remaining_base_load_kw: Loads = Field(description="剩余时段的新基础负荷预测（kW）")
+    remaining_pv_kw: Pvs = Field(description="剩余时段的新光伏预测功率（kW）")
+
+    @model_validator(mode="after")
+    def _validate(self) -> "RescheduleRequest":
+        if not math.isfinite(self.audit_tolerance_kwh):
+            raise ValueError("audit_tolerance_kwh 必须是有限数值")
+        # 前缀记录的有限/非负/SOC 容量约束与审计、结算接口一致（容量取 dispatch 输入口径）
+        _validate_telemetry_records(self.records, self.dispatch.capacity_kwh)
+
+        n = len(self.plan_snapshot.periods)
+        k = len(self.records)
+        if k >= n:
+            raise ValueError(
+                f"已执行前缀长度 {k} 必须小于计划时段数 {n}：续排须留有待执行时段"
+            )
+        m = n - k
+        for name, seq in (
+            ("剩余时段电价", self.remaining_prices),
+            ("剩余时段基础负荷", self.remaining_base_load_kw),
+            ("剩余时段光伏预测", self.remaining_pv_kw),
+        ):
+            if len(seq) != m:
+                raise ValueError(
+                    f"{name}长度 {len(seq)} 与剩余时段数 {m} 不符"
+                    f"（计划共 {n} 段，已执行前缀 {k} 段）"
+                )
+            for i, v in enumerate(seq):
+                if not math.isfinite(v):
+                    raise ValueError(f"{name}第 {i} 个时段不是有限数值：{v}")
+                if v < 0:
+                    raise ValueError(f"{name}不允许为负值，第 {i} 个时段为 {v}")
+        return self
+
+
+class RescheduleExecutedPeriod(BaseModel):
+    """原时间轴上已执行的时段：回显实测记录，并按结算口径计实测费用。"""
+
+    index: int
+    status: Literal["executed"]
+    base_load_kw: float
+    pv_kw: float
+    charge_ac_energy_kwh: float
+    discharge_ac_energy_kwh: float
+    grid_purchase_energy_kwh: float
+    soc_start_kwh: float
+    soc_end_kwh: float
+    battery_throughput_kwh: float = Field(
+        description="实测电芯侧吞吐量 = 交流充电×ηc + 交流放电÷ηd"
+    )
+    energy_cost_yuan: float = Field(description="实测能量费 = 原电价 × 实测购电量")
+    degradation_cost_yuan: float = Field(description="实测衰减费 = 衰减单价 × 实测吞吐量")
+    total_cost_yuan: float
+
+
+class RescheduleScheduledPeriod(PeriodPlan):
+    """原时间轴上待执行的时段：续排计划（index 为原时间轴下标）。"""
+
+    status: Literal["scheduled"]
+
+
+ReschedulePeriod = Annotated[
+    Union[RescheduleExecutedPeriod, RescheduleScheduledPeriod],
+    Field(discriminator="status"),
+]
+
+
+class ReschedulePrefixAudit(BaseModel):
+    num_records: int
+    energy_tolerance_kwh: float
+    anomalous: bool = Field(description="是否存在异常记录（异常即整体拒绝，成功响应恒为 false）")
+    anomalous_records: List[int]
+    initial_soc_gap_kwh: float = Field(description="首条记录首态 SOC − 原初始 SOC（容差内才放行）")
+
+
+class RescheduleSummary(BaseModel):
+    executed_periods: int
+    scheduled_periods: int
+    prefix_end_soc_kwh: float = Field(description="前缀末态 SOC，即余段重排的初始 SOC")
+    actual_prefix_grid_purchase_kwh: float
+    actual_prefix_battery_throughput_kwh: float
+    actual_prefix_energy_cost_yuan: float
+    actual_prefix_degradation_cost_yuan: float
+    actual_prefix_total_cost_yuan: float
+    scheduled_grid_purchase_kwh: float
+    scheduled_battery_throughput_kwh: float
+    scheduled_energy_cost_yuan: float
+    scheduled_degradation_cost_yuan: float
+    scheduled_total_cost_yuan: float
+    scheduled_terminal_soc_kwh: float
+    projected_energy_cost_yuan: float = Field(description="全程能量费 = 实测前缀 + 余段预测")
+    projected_degradation_cost_yuan: float = Field(description="全程衰减费 = 实测前缀 + 余段预测")
+    projected_total_cost_yuan: float = Field(description="全程总费用 = 实测前缀 + 余段预测")
+    original_plan_total_cost_yuan: float = Field(description="原计划总费用（重算口径）")
+    projected_cost_delta_yuan: float = Field(description="全程预计总费用 − 原计划总费用")
+
+
+class RescheduleResponse(BaseModel):
+    num_periods: int = Field(description="原时间轴总时段数")
+    executed_periods: int
+    scheduled_periods: int
+    period_hours: float
+    audit_tolerance_kwh: float
+    prefix_end_soc_kwh: float
+    periods: List[ReschedulePeriod] = Field(
+        description="原时间轴明细：已执行时段回显实测，待执行时段为续排计划"
+    )
+    summary: RescheduleSummary
+    prefix_audit: ReschedulePrefixAudit
+    remaining_dispatch: DispatchRequest = Field(
+        description="余段调度输入：可直接作为 /dispatch 请求或 /dispatch/settlement 的 dispatch 字段"
+    )
+    remaining_plan_snapshot: DispatchResponse = Field(
+        description="余段计划快照：与 remaining_dispatch 配对，可直接用于 /dispatch/settlement"
+    )
 
 
 class ErrorResponse(BaseModel):

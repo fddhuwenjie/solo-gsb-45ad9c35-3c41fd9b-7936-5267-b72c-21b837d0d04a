@@ -11,11 +11,14 @@ from app.models import (
     DispatchRequest,
     DispatchResponse,
     ErrorResponse,
+    RescheduleRequest,
+    RescheduleResponse,
     SettlementRequest,
     SettlementResponse,
     TelemetryAuditRequest,
     TelemetryAuditResponse,
 )
+from app.reschedule import RescheduleError, execute_reschedule
 from app.settlement import SettlementError, execute_settlement
 from app.solver import InfeasibleError, solve_dispatch
 
@@ -27,9 +30,12 @@ app = FastAPI(
         "另提供 /telemetry/audit 对半小时实测记录做电芯能量守恒与购电量核对"
         "（只审计标记异常，不修正读数、不生成调度计划）；"
         "/dispatch/settlement 对已下发计划做执行结算：重算校验计划快照、"
-        "复用遥测审计并核对 SOC 轨迹，仅对首个异常/断点之前的连续有效区间计费。"
+        "复用遥测审计并核对 SOC 轨迹，仅对首个异常/断点之前的连续有效区间计费；"
+        "/dispatch/reschedule 在计划执行中途按实测状态续排：重算校验快照、"
+        "遥测审计核对已执行前缀后，从实测末态出发按剩余时段的新预测重排，"
+        "并给出可直接交给结算接口的余段调度输入与计划快照。"
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -58,6 +64,14 @@ async def infeasible_exception_handler(request: Request, exc: InfeasibleError):
 
 @app.exception_handler(SettlementError)
 async def settlement_error_handler(request: Request, exc: SettlementError):
+    return JSONResponse(
+        status_code=422,
+        content={"error": exc.code, "reason": str(exc)},
+    )
+
+
+@app.exception_handler(RescheduleError)
+async def reschedule_error_handler(request: Request, exc: RescheduleError):
     return JSONResponse(
         status_code=422,
         content={"error": exc.code, "reason": str(exc)},
@@ -137,3 +151,30 @@ async def dispatch_settlement(req: SettlementRequest) -> SettlementResponse:
         records=req.records,
     )
     return SettlementResponse.model_validate(result)
+
+
+@app.post(
+    "/dispatch/reschedule",
+    response_model=RescheduleResponse,
+    responses={422: {"model": ErrorResponse, "description": "非法输入或续排整体拒绝"}},
+    tags=["dispatch"],
+)
+async def dispatch_reschedule(req: RescheduleRequest) -> RescheduleResponse:
+    """计划中途续排：核对快照与前缀实测，从实测末态按新预测重排剩余时段。
+
+    - 快照篡改（plan_snapshot_mismatch）、前缀审计异常或首条 SOC 脱节
+      （prefix_audit_failed）、前缀末态不在 0.1kWh 网格（prefix_end_soc_off_grid）、
+      原末端 SOC 约束已无法满足（infeasible）均整体拒绝；
+    - 已执行前缀只要实测自洽即保留原记录（即使偏离旧计划），余段从实测末态重排，
+      SOC 与前缀末态衔接；余段调度输入与计划快照可直接交给 /dispatch/settlement。
+    """
+    result = execute_reschedule(
+        dispatch_input=req.dispatch.model_dump(),
+        plan_snapshot=req.plan_snapshot.model_dump(),
+        audit_tolerance_kwh=req.audit_tolerance_kwh,
+        records=req.records,
+        remaining_prices=req.remaining_prices,
+        remaining_base_load_kw=req.remaining_base_load_kw,
+        remaining_pv_kw=req.remaining_pv_kw,
+    )
+    return RescheduleResponse.model_validate(result)
