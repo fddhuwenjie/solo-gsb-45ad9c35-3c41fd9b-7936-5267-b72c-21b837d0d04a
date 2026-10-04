@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from typing import Annotated, List, Literal, Optional, Sequence
+from typing import Annotated, List, Literal, Optional, Sequence, Union
 
 from pydantic import BaseModel, Field, model_validator
 
@@ -341,6 +341,158 @@ class SettlementResponse(BaseModel):
     periods: List[SettlementPeriodResult]
     summary: SettlementSummary
     audit_summary: SettlementAuditSummary
+
+
+class ReplanRequest(BaseModel):
+    """中途续排请求：原始 /dispatch 输入、其计划快照、连续实测前缀与余段新预测。"""
+
+    dispatch: DispatchRequest = Field(description="生成原计划时使用的完整 /dispatch 输入")
+    plan_snapshot: DispatchResponse = Field(
+        description="当初 /dispatch 返回的计划快照（periods + summary），服务端会重算并核对"
+    )
+    audit_tolerance_kwh: float = Field(
+        ge=0.0, description="审计容差（kWh），沿用遥测审计规则：残差绝对值严格大于它即判异常"
+    )
+    executed_records: Annotated[
+        List[TelemetryRecord], Field(min_length=1, max_length=MAX_PERIODS - 1)
+    ] = Field(description="自原时间轴起点连续已执行的半小时实测记录，至少一段、且不得覆盖全周期")
+    remaining_prices: Prices = Field(description="剩余时段的新电价预测（元/kWh），至少一段")
+    remaining_base_load_kw: Loads = Field(description="剩余时段的新基础负荷预测（kW），至少一段")
+    remaining_pv_kw: Pvs = Field(description="剩余时段的新光伏预测功率（kW），至少一段")
+
+    @model_validator(mode="after")
+    def _validate(self) -> "ReplanRequest":
+        if not math.isfinite(self.audit_tolerance_kwh):
+            raise ValueError("audit_tolerance_kwh 必须是有限数值")
+        # 实测记录的有限/非负/SOC 容量约束与审计接口一致（容量取 dispatch 输入口径）
+        _validate_telemetry_records(self.executed_records, self.dispatch.capacity_kwh)
+        n = len(self.plan_snapshot.periods)
+        k = len(self.executed_records)
+        if k >= n:
+            raise ValueError(
+                f"已执行实测记录 {k} 段须少于原计划时段数 {n}，续排需留有待执行时段"
+            )
+        remaining_n = n - k
+        if (
+            len(self.remaining_prices) != remaining_n
+            or len(self.remaining_base_load_kw) != remaining_n
+            or len(self.remaining_pv_kw) != remaining_n
+        ):
+            raise ValueError(
+                f"余段预测长度应为 {remaining_n}（原计划 {n} 段 − 已执行 {k} 段），"
+                f"当前电价、基础负荷、光伏分别为 "
+                f"{len(self.remaining_prices)}、{len(self.remaining_base_load_kw)}、"
+                f"{len(self.remaining_pv_kw)}"
+            )
+        for name, seq in (
+            ("余段电价", self.remaining_prices),
+            ("余段基础负荷", self.remaining_base_load_kw),
+            ("余段光伏预测", self.remaining_pv_kw),
+        ):
+            for i, v in enumerate(seq):
+                if not math.isfinite(v):
+                    raise ValueError(f"{name}第 {i} 个时段不是有限数值：{v}")
+                if v < 0:
+                    raise ValueError(f"{name}不允许为负值，第 {i} 个时段为 {v}")
+        return self
+
+
+class ReplanExecutedPeriod(BaseModel):
+    """原时间轴上已执行时段的明细：实测口径计费 + 原计划回显 + 审计残差。"""
+
+    index: int = Field(description="原时间轴上的时段下标")
+    status: Literal["executed"]
+    record: TelemetryRecord = Field(description="原始实测记录，原样保留（含对旧计划的偏离）")
+    plan: SettlementPeriodPlan = Field(description="原计划该时段的计划口径数据")
+    soc_gap_start_kwh: float = Field(description="实测首态 SOC − 原计划首态 SOC")
+    soc_gap_end_kwh: float = Field(description="实测末态 SOC − 原计划末态 SOC")
+
+    actual_grid_purchase_energy_kwh: float
+    actual_battery_throughput_kwh: float = Field(
+        description="实测电芯侧吞吐量 = 交流充电×ηc + 交流放电÷ηd"
+    )
+    actual_energy_cost_yuan: float
+    actual_degradation_cost_yuan: float
+    actual_total_cost_yuan: float
+
+    planned_energy_cost_yuan: float
+    planned_degradation_cost_yuan: float
+    planned_total_cost_yuan: float
+
+    energy_cost_delta_yuan: float = Field(description="实测能量费 − 原计划能量费")
+    degradation_cost_delta_yuan: float
+    total_cost_delta_yuan: float
+    grid_purchase_delta_kwh: float
+    throughput_delta_kwh: float
+
+    audit: TelemetryRecordAudit
+    reasons: List[str] = Field(
+        description="恒为空数组：能进入续排说明前缀审计全部通过；SOC 对旧计划的偏离不是异常"
+    )
+
+
+class ReplanPlannedPeriod(PeriodPlan):
+    """余段新计划的逐时段计划（字段同 /dispatch 的 PeriodPlan），附加状态与时间轴下标。"""
+
+    status: Literal["planned"]
+    remaining_index: int = Field(description="在余段内的相对下标（从 0 起）")
+
+
+ReplanTimelinePeriod = Annotated[
+    Union[ReplanExecutedPeriod, ReplanPlannedPeriod],
+    Field(discriminator="status"),
+]
+
+
+class ReplanExecutedSummary(BaseModel):
+    """实测前缀汇总（按 /dispatch/settlement 现有结算口径）。"""
+
+    executed_periods: int
+    final_soc_kwh: float = Field(description="前缀末态 SOC（余段调度的初始 SOC，落在 0.1kWh 网格）")
+    actual_grid_purchase_kwh: float
+    planned_grid_purchase_kwh: float
+    grid_purchase_delta_kwh: float
+    actual_battery_throughput_kwh: float
+    planned_battery_throughput_kwh: float
+    throughput_delta_kwh: float
+    actual_energy_cost_yuan: float
+    planned_energy_cost_yuan: float
+    energy_cost_delta_yuan: float
+    actual_degradation_cost_yuan: float
+    planned_degradation_cost_yuan: float
+    degradation_cost_delta_yuan: float
+    actual_total_cost_yuan: float
+    planned_total_cost_yuan: float
+    total_cost_delta_yuan: float
+
+
+class ReplanResponse(BaseModel):
+    num_periods: int = Field(description="原计划总时段数")
+    period_hours: float
+    audit_tolerance_kwh: float
+    executed_periods: int = Field(description="已执行连续前缀时段数（自下标 0 起）")
+    remaining_periods: int = Field(description="余段待执行时段数")
+
+    periods: List[ReplanTimelinePeriod] = Field(
+        description="原时间轴上已执行（executed）与待执行（planned）的逐时段明细，按 index 升序"
+    )
+
+    executed_summary: ReplanExecutedSummary
+    remaining_summary: DispatchSummary = Field(
+        description="余段新计划的汇总（口径同 /dispatch 的 summary；费用仅覆盖余段）"
+    )
+
+    actual_prefix_total_cost_yuan: float = Field(description="实测前缀总费用（能量费+衰减费）")
+    remaining_forecast_total_cost_yuan: float = Field(description="余段预测总费用（能量费+衰减费）")
+    total_cost_yuan: float = Field(description="前缀实测费用 + 余段预测费用")
+
+    remaining_dispatch: DispatchRequest = Field(
+        description="可直接 POST 给 /dispatch/settlement 的余段调度输入："
+        "初始 SOC 取前缀末态，数组只覆盖余段新预测，末端 SOC 约束沿用原输入"
+    )
+    remaining_plan_snapshot: DispatchResponse = Field(
+        description="可与 remaining_dispatch 一起交给 /dispatch/settlement 的余段计划快照"
+    )
 
 
 class ErrorResponse(BaseModel):

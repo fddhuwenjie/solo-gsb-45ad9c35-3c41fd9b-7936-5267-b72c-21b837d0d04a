@@ -1,6 +1,6 @@
 # 家庭储能时段调度 API
 
-基于 **Python + FastAPI + Pydantic** 的家庭储能调度服务。输入等长的半小时电价、基础负荷、光伏预测序列以及电池参数，用**动态规划（SOC 离散到 0.1 kWh）**求出满足功率、SOC 和末端 SOC 约束的**最低总成本**充放电计划；另提供 `/telemetry/audit` 对半小时实测记录做能量守恒与购电量**审计**（只核对标记，不修正读数、不生成调度计划）；`/dispatch/settlement` 对一份已下发计划做**执行结算**：携带原始 `/dispatch` 输入与计划快照，服务重算校验快照未被篡改、复用遥测审计逐条核对，并只对首个异常 / SOC 断点之前的连续有效区间按实测购电量与吞吐量计费。
+基于 **Python + FastAPI + Pydantic** 的家庭储能调度服务。输入等长的半小时电价、基础负荷、光伏预测序列以及电池参数，用**动态规划（SOC 离散到 0.1 kWh）**求出满足功率、SOC 和末端 SOC 约束的**最低总成本**充放电计划；另提供 `/telemetry/audit` 对半小时实测记录做能量守恒与购电量**审计**（只核对标记，不修正读数、不生成调度计划）；`/dispatch/settlement` 对一份已下发计划做**执行结算**：携带原始 `/dispatch` 输入与计划快照，服务重算校验快照未被篡改、复用遥测审计逐条核对，并只对首个异常 / SOC 断点之前的连续有效区间按实测购电量与吞吐量计费；`/dispatch/replan` 支持计划**执行到中途**时依据连续实测前缀**续排**：核对原计划与前缀审计、保留实测原记录并从实测末态重排余段，同时返回可直接交给结算接口的余段调度输入与计划快照。
 
 ## 一条命令启动
 
@@ -375,6 +375,176 @@ curl -s -X POST http://localhost:8000/dispatch/settlement \
 
 待结算记录的各 `actual_*` 与差额字段为 `null`，但计划口径（`planned_*`）、审计残差、SOC 偏差（`soc_gap_start_kwh` / `soc_gap_end_kwh`）与冻结原因照常返回，便于人工复核。
 
+### `POST /dispatch/replan`
+
+计划执行到**中途**时，依据连续实测状态续排余段。请求包含六样东西：
+
+| 字段 | 说明 |
+|---|---|
+| `dispatch` | 生成原计划时使用的**完整 `/dispatch` 输入** |
+| `plan_snapshot` | 当初 `/dispatch` 返回的计划快照（`periods` + `summary` 原样回传） |
+| `audit_tolerance_kwh` | 审计容差（kWh，非负），规则与 `/telemetry/audit` 完全一致：残差绝对值**严格大于**它才判异常 |
+| `executed_records` | 自原时间轴起点**连续已执行**的半小时实测记录（字段同 `/telemetry/audit`），至少一段、且必须**留有待执行时段**（段数 < 原计划时段数） |
+| `remaining_prices` | 剩余时段的**新电价**预测，长度 = 原时段数 − 已执行段数 |
+| `remaining_base_load_kw` / `remaining_pv_kw` | 剩余时段的**新负荷 / 光伏**预测，长度同上 |
+
+服务端处理顺序：
+
+1. **重算核对原计划**：用现有求解器对 `dispatch` 重算，逐字段比对 `plan_snapshot`（与结算同一套防篡改核对），不一致即拒绝；
+2. **审计实测前缀**：按现有遥测审计规则核对连续前缀（电芯能量守恒、购电量平衡、相邻记录 SOC 衔接），并额外要求**首条记录的首态 SOC 在审计容差内接原初值**；
+3. **保留实测、从末态重排**：已执行动作即使偏离旧计划，只要实测自洽就**保留原记录**（不做 SOC 断点判定），并从前缀末态重新安排余段；前缀末态 SOC 必须落在 **0.1kWh 网格**上，否则离散求解无法精确承接；
+4. **末端约束核对**：原 `min_terminal_soc_kwh` 约束从实测末态起、在余段新预测下仍须可达，否则按无解拒绝；
+5. **输出**：原时间轴上已执行（`executed`）与待执行（`planned`）的逐时段明细；按**现有结算口径**计算的实测前缀费用（实测购电量×电价 + 实测电芯吞吐量×衰减单价）加余段预测费用；以及可**直接交给 `/dispatch/settlement`** 的余段调度输入（`remaining_dispatch`，初始 SOC 已设为前缀末态）与余段计划快照（`remaining_plan_snapshot`）。
+
+示例（前 2 段按原计划执行，余段 t2 电价从 1 元更新为 5 元）：
+
+```bash
+curl -s -X POST http://localhost:8000/dispatch/replan \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "dispatch": {
+      "prices": [0.0, 1.0, 1.0, 0.0],
+      "base_load_kw": [0.2, 0.2, 0.2, 0.2],
+      "pv_kw": [0.0, 0.0, 0.0, 0.0],
+      "capacity_kwh": 0.4,
+      "max_charge_kw": 1.0,
+      "max_discharge_kw": 1.0,
+      "charge_efficiency": 0.9,
+      "discharge_efficiency": 0.9,
+      "initial_soc_kwh": 0.0,
+      "min_terminal_soc_kwh": 0.0,
+      "degradation_cost_per_kwh": 0.2
+    },
+    "plan_snapshot": { "...": "原样回传 /dispatch 的完整响应（periods + summary）" },
+    "audit_tolerance_kwh": 0.01,
+    "executed_records": [
+      {"base_load_kw": 0.2, "pv_kw": 0.0,
+       "charge_ac_energy_kwh": 0.222222, "discharge_ac_energy_kwh": 0.0,
+       "grid_purchase_energy_kwh": 0.322222, "soc_start_kwh": 0.0, "soc_end_kwh": 0.2},
+      {"base_load_kw": 0.2, "pv_kw": 0.0,
+       "charge_ac_energy_kwh": 0.0, "discharge_ac_energy_kwh": 0.09,
+       "grid_purchase_energy_kwh": 0.01, "soc_start_kwh": 0.2, "soc_end_kwh": 0.1}
+    ],
+    "remaining_prices": [5.0, 0.0],
+    "remaining_base_load_kw": [0.2, 0.2],
+    "remaining_pv_kw": [0.0, 0.0]
+  }'
+```
+
+```json
+{
+  "num_periods": 4,
+  "period_hours": 0.5,
+  "audit_tolerance_kwh": 0.01,
+  "executed_periods": 2,
+  "remaining_periods": 2,
+  "periods": [
+    {
+      "index": 0,
+      "status": "executed",
+      "record": {"...": "原始实测记录原样保留"},
+      "plan": {
+        "action": "charge",
+        "grid_purchase_energy_kwh": 0.322222,
+        "battery_throughput_kwh": 0.2,
+        "energy_cost_yuan": 0.0,
+        "degradation_cost_yuan": 0.04,
+        "soc_start_kwh": 0.0,
+        "soc_end_kwh": 0.2
+      },
+      "soc_gap_start_kwh": 0.0,
+      "soc_gap_end_kwh": 0.0,
+      "actual_grid_purchase_energy_kwh": 0.322222,
+      "actual_battery_throughput_kwh": 0.2,
+      "actual_energy_cost_yuan": 0.0,
+      "actual_degradation_cost_yuan": 0.04,
+      "actual_total_cost_yuan": 0.04,
+      "planned_energy_cost_yuan": 0.0,
+      "planned_degradation_cost_yuan": 0.04,
+      "planned_total_cost_yuan": 0.04,
+      "energy_cost_delta_yuan": 0.0,
+      "degradation_cost_delta_yuan": 0.0,
+      "total_cost_delta_yuan": 0.0,
+      "grid_purchase_delta_kwh": 0.0,
+      "throughput_delta_kwh": 0.0,
+      "audit": {"index": 0, "anomalous": false, "reasons": [], "...": "三类分项残差同 /telemetry/audit"},
+      "reasons": []
+    },
+    {"index": 1, "status": "executed", "...": "同结构；实测自洽即通过，对旧计划的偏离只体现在 soc_gap_* 与各 delta 中"},
+    {
+      "index": 2,
+      "status": "planned",
+      "remaining_index": 0,
+      "action": "discharge",
+      "action_energy_kwh": -0.1,
+      "charge_ac_energy_kwh": 0.0,
+      "discharge_ac_energy_kwh": 0.09,
+      "battery_power_kw": -0.18,
+      "grid_purchase_energy_kwh": 0.01,
+      "pv_curtailed_energy_kwh": 0.0,
+      "soc_start_kwh": 0.1,
+      "soc_end_kwh": 0.0,
+      "energy_cost_yuan": 0.05,
+      "degradation_cost_yuan": 0.02
+    },
+    {"index": 3, "status": "planned", "remaining_index": 1, "action": "idle", "...": "..."}
+  ],
+  "executed_summary": {
+    "executed_periods": 2,
+    "final_soc_kwh": 0.1,
+    "actual_grid_purchase_kwh": 0.332222,
+    "planned_grid_purchase_kwh": 0.332222,
+    "grid_purchase_delta_kwh": 0.0,
+    "actual_battery_throughput_kwh": 0.3,
+    "planned_battery_throughput_kwh": 0.3,
+    "throughput_delta_kwh": 0.0,
+    "actual_energy_cost_yuan": 0.01,
+    "planned_energy_cost_yuan": 0.01,
+    "energy_cost_delta_yuan": 0.0,
+    "actual_degradation_cost_yuan": 0.06,
+    "planned_degradation_cost_yuan": 0.06,
+    "degradation_cost_delta_yuan": 0.0,
+    "actual_total_cost_yuan": 0.07,
+    "planned_total_cost_yuan": 0.07,
+    "total_cost_delta_yuan": 0.0
+  },
+  "remaining_summary": { "...": "余段计划的 summary，口径同 /dispatch（num_periods=2）" },
+  "actual_prefix_total_cost_yuan": 0.07,
+  "remaining_forecast_total_cost_yuan": 0.07,
+  "total_cost_yuan": 0.14,
+  "remaining_dispatch": {
+    "prices": [5.0, 0.0],
+    "base_load_kw": [0.2, 0.2],
+    "pv_kw": [0.0, 0.0],
+    "capacity_kwh": 0.4,
+    "max_charge_kw": 1.0,
+    "max_discharge_kw": 1.0,
+    "charge_efficiency": 0.9,
+    "discharge_efficiency": 0.9,
+    "initial_soc_kwh": 0.1,
+    "min_terminal_soc_kwh": 0.0,
+    "degradation_cost_per_kwh": 0.2
+  },
+  "remaining_plan_snapshot": { "...": "余段计划（periods + summary），与 remaining_dispatch 配套" }
+}
+```
+
+要点：
+
+- `periods` 按**原时间轴下标**升序混合返回：已执行段 `status=executed`（含原始记录、原计划回显、实测费用、与原计划的差额、审计残差；偏离旧计划不是异常），待执行段 `status=planned`（字段同 `/dispatch` 的逐时段计划，另带余段内相对下标 `remaining_index`）；
+- `remaining_dispatch.initial_soc_kwh` 等于前缀末态 SOC（`executed_summary.final_soc_kwh`），余段首时段 `soc_start_kwh` 与之**严格衔接**；末端 SOC 约束、容量、效率、功率、衰减单价均沿用原输入；
+- 费用三段并列：`actual_prefix_total_cost_yuan`（前缀实测）、`remaining_forecast_total_cost_yuan`（余段按新电价/负荷/光伏的预测）、`total_cost_yuan`（两者之和）。
+
+余段执行完后，把 `remaining_dispatch`、`remaining_plan_snapshot` 与余段实测记录一起 POST 给 `/dispatch/settlement` 即可完成余段结算（快照可通过重算核对）。
+
+整体拒绝（HTTP 422）的情形：
+
+- `plan_snapshot_mismatch`：原计划快照与重算不一致；原输入重算无解时为 `infeasible`；
+- `prefix_audit_failed`：首条记录首态 SOC 未在容差内接原初值，或前缀中任一条未通过遥测审计；
+- `prefix_soc_off_grid`：前缀末态 SOC 不落在 0.1kWh 网格（或超出容量）；
+- `infeasible`：从实测末态出发，原末端 SOC 约束在余段新预测下已无法满足；
+- `invalid_input`：前缀为空 / 覆盖全周期、余段预测长度与剩余时段数不符、容差或测量值非法等。
+
 ## 模型与假设
 
 - **时段**：固定 0.5 h；功率（kW）× 0.5 即该时段能量（kWh）。
@@ -433,6 +603,16 @@ curl -s -X POST http://localhost:8000/dispatch/settlement \
 - `no_valid_interval`：首条记录即未通过遥测审计或 SOC 轨迹核对，没有任何可结算前缀；
 - 部分记录异常 / 断点**不是**错误：返回 HTTP 200 与 `status=partially_settled`，仅冻结异常点及后续记录。
 
+`/dispatch/replan` 同样为整体拒绝返回 422，错误码包括：
+
+- `plan_snapshot_mismatch`：原计划快照与按 `dispatch` 重算的结果不一致（原输入本身无解为 `infeasible`）；
+- `prefix_audit_failed`：首条实测首态 SOC 未在容差内接原初值，或连续前缀中存在遥测审计异常（电芯能量 / 购电量 / SOC 衔接）；
+- `prefix_soc_off_grid`：前缀末态 SOC 不落在 0.1kWh 网格上（离散调度只能从整格 SOC 起步）；
+- `infeasible`：从实测末态出发，原末端 SOC 约束在余段新预测下已无法满足；
+- `invalid_input`：前缀为空或覆盖全周期、余段预测长度不等于剩余时段数、容差为负 / 非有限、测量值为负 / 非有限、SOC 超容量等。
+
+注意：已执行动作**偏离旧计划**本身不构成拒绝——只要实测记录自洽（含相邻记录 SOC 衔接），偏离只作为 `soc_gap_*` 与各费用差额信息返回，续排一律以实测末态为准。
+
 ## 测试
 
 ```bash
@@ -440,4 +620,4 @@ pip install pytest httpx
 pytest tests/ -q
 ```
 
-覆盖谷充峰放套利、效率损耗与衰减费核算、末端 SOC 约束、禁止倒送、光伏免费充电、无解诊断、各类非法输入，以及峰值与字典序两级破平局；遥测审计部分覆盖自洽记录通过、三类残差（电芯能量 / 购电量 / SOC 衔接）越限标记、容差边界（等于容差不判异常）、光伏盈余购电截断，以及容量 / 效率 / 容差 / 测量值的非法输入拦截。结算部分覆盖：全部有效全额结算（含容差内购电偏差计入费用差额、实测吞吐量衰减费核算、预测偏差场景）、审计异常与 SOC 断点起的前缀冻结、断点与衔接异常的区分、计划快照（periods / summary / 动作）篡改拒绝、dispatch 输入与快照不匹配拒绝、长度不符与无有效区间拒绝、重算无解传播，以及既有三个接口行为不变。
+覆盖谷充峰放套利、效率损耗与衰减费核算、末端 SOC 约束、禁止倒送、光伏免费充电、无解诊断、各类非法输入，以及峰值与字典序两级破平局；遥测审计部分覆盖自洽记录通过、三类残差（电芯能量 / 购电量 / SOC 衔接）越限标记、容差边界（等于容差不判异常）、光伏盈余购电截断，以及容量 / 效率 / 容差 / 测量值的非法输入拦截。结算部分覆盖：全部有效全额结算（含容差内购电偏差计入费用差额、实测吞吐量衰减费核算、预测偏差场景）、审计异常与 SOC 断点起的前缀冻结、断点与衔接异常的区分、计划快照（periods / summary / 动作）篡改拒绝、dispatch 输入与快照不匹配拒绝、长度不符与无有效区间拒绝、重算无解传播，以及既有三个接口行为不变。续排部分覆盖：原时间轴已执行/待执行明细与费用口径、余段电价变化后的最优重排、实测偏离旧计划但自洽时保留原记录并从末态重排、容差内表计偏差照实计费、余段输入与快照的结算接口端到端衔接（含余段仅一段）、首态 SOC 容差边界（等于容差通过、超出拒绝），以及前缀审计异常、首态未接原初值、末态非 0.1kWh 网格、余段末端约束不可达（`infeasible`）、快照篡改、长度不符、空前缀/全周期前缀、非法容差/测量值/余段预测等各类整体拒绝。

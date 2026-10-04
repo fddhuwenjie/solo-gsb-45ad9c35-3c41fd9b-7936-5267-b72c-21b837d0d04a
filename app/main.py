@@ -11,11 +11,14 @@ from app.models import (
     DispatchRequest,
     DispatchResponse,
     ErrorResponse,
+    ReplanRequest,
+    ReplanResponse,
     SettlementRequest,
     SettlementResponse,
     TelemetryAuditRequest,
     TelemetryAuditResponse,
 )
+from app.replan import ReplanError, execute_replan
 from app.settlement import SettlementError, execute_settlement
 from app.solver import InfeasibleError, solve_dispatch
 
@@ -27,9 +30,11 @@ app = FastAPI(
         "另提供 /telemetry/audit 对半小时实测记录做电芯能量守恒与购电量核对"
         "（只审计标记异常，不修正读数、不生成调度计划）；"
         "/dispatch/settlement 对已下发计划做执行结算：重算校验计划快照、"
-        "复用遥测审计并核对 SOC 轨迹，仅对首个异常/断点之前的连续有效区间计费。"
+        "复用遥测审计并核对 SOC 轨迹，仅对首个异常/断点之前的连续有效区间计费；"
+        "/dispatch/replan 支持计划执行中途依据连续实测前缀续排：核对原计划与前缀审计、"
+        "从实测末态重排余段，并给出可直接交给 /dispatch/settlement 的余段输入与快照。"
     ),
-    version="1.2.0",
+    version="1.3.0",
 )
 
 
@@ -58,6 +63,14 @@ async def infeasible_exception_handler(request: Request, exc: InfeasibleError):
 
 @app.exception_handler(SettlementError)
 async def settlement_error_handler(request: Request, exc: SettlementError):
+    return JSONResponse(
+        status_code=422,
+        content={"error": exc.code, "reason": str(exc)},
+    )
+
+
+@app.exception_handler(ReplanError)
+async def replan_error_handler(request: Request, exc: ReplanError):
     return JSONResponse(
         status_code=422,
         content={"error": exc.code, "reason": str(exc)},
@@ -137,3 +150,30 @@ async def dispatch_settlement(req: SettlementRequest) -> SettlementResponse:
         records=req.records,
     )
     return SettlementResponse.model_validate(result)
+
+
+@app.post(
+    "/dispatch/replan",
+    response_model=ReplanResponse,
+    responses={422: {"model": ErrorResponse, "description": "非法输入、快照不符、前缀异常或余段无解"}},
+    tags=["replan"],
+)
+async def dispatch_replan(req: ReplanRequest) -> ReplanResponse:
+    """计划执行中途按实测状态续排。
+
+    - 先重算并核对原计划快照，再按现有遥测审计规则核对连续实测前缀；
+      首条记录首态 SOC 须在审计容差内接原初值；
+    - 已执行动作即使偏离旧计划，只要实测自洽即保留原记录，从实测末态重排余段；
+    - 前缀异常（prefix_audit_failed）、末态不在 0.1kWh 网格（prefix_soc_off_grid）、
+      原末端 SOC 约束从实测末态已无法满足（infeasible）时整体拒绝。
+    """
+    result = execute_replan(
+        dispatch_input=req.dispatch.model_dump(),
+        plan_snapshot=req.plan_snapshot.model_dump(),
+        audit_tolerance_kwh=req.audit_tolerance_kwh,
+        executed_records=req.executed_records,
+        remaining_prices=req.remaining_prices,
+        remaining_base_load_kw=req.remaining_base_load_kw,
+        remaining_pv_kw=req.remaining_pv_kw,
+    )
+    return ReplanResponse.model_validate(result)
